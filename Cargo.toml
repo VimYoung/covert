@@ -1,0 +1,9 @@
+[package]
+name = "covert"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embassy-executor = "0.9.1"
+embassy-nrf = "0.8.0"
+embassy-time = "0.5.0"
