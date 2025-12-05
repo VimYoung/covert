@@ -1,91 +1,109 @@
 #![no_std]
 #![no_main]
 
-use embassy_executor::Spawner;
-use embassy_nrf::bind_interrupts;
-use embassy_nrf::gpio::{Input, Level, Output, Pull};
-use embassy_nrf::peripherals::*;
-use embassy_nrf::usb::Driver as UsbDriver;
-use embassy_time::{Duration, Timer};
-use {defmt_rtt as _, panic_probe as _};
+use cortex_m_rt::entry;
+use panic_halt as _;
+use nrf52840_hal as hal;
 
-bind_interrupts!(struct Irqs {
-    USBD => embassy_nrf::usb::InterruptHandler;
-});
+use hal::{
+    pac,
+    gpio::{p0::Parts as P0Parts, Level, Output, PushPull, Input, PullUp},
+    prelude::*,
+    spim::Spim,
+    usbd::{UsbPeripheral, Usbd},
+    timer::Timer,
+};
 
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
+#[derive(Clone, Copy)]
+enum DeviceMode {
     PassiveJackUsb,
     BtSingle,
     BtMulti,
 }
 
-static mut MODE: Mode = Mode::PassiveJackUsb;
+#[entry]
+fn main() -> ! {
+    let p = pac::Peripherals::take().unwrap();
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    let p0 = P0Parts::new(p.P0);
 
-    let usb_drv = UsbDriver::new(p.USBD, Irqs);
-    spawner.spawn(usb_task(usb_drv)).unwrap();
+    // --- Button ---
+    let button = p0.p0_11.into_pullup_input();
 
-    let btn = Input::new(p.P0_11, Pull::Up);
-    let mut led = Output::new(p.P1_15, Level::Low);
+    // --- RGB LED ---
+    let mut led_r = p0.p0_12.into_push_pull_output(Level::Low);
+    let mut led_g = p0.p0_13.into_push_pull_output(Level::Low);
+    let mut led_b = p0.p0_14.into_push_pull_output(Level::Low);
 
-    let mut bt = bluetooth::BtController::new();
+    // --- Audio input/output pins ---
+    let _audio_in = p0.p0_02.into_floating_input();
+    let _audio_out = p0.p0_03.into_push_pull_output(Level::Low);
+
+    // --- USB ---
+    let usb_periph = UsbPeripheral::new(p.USBD, p0.p0_25, p0.p0_26);
+    let _usbd = Usbd::new(usb_periph);
+
+    // --- SPI / I2C for BT module ---
+    let spim = Spim::new(
+        p.SPIM0,
+        hal::spim::Pins {
+            sck: p0.p0_15.into_push_pull_output(Level::Low).degrade(),
+            mosi: Some(p0.p0_16.into_push_pull_output(Level::Low).degrade()),
+            miso: Some(p0.p0_17.into_floating_input().degrade()),
+        },
+        hal::spim::Frequency::M8,
+        hal::spim::MODE_0,
+        0,
+    );
+
+    let mut mode = DeviceMode::PassiveJackUsb;
+    let mut last_button_state = true;
 
     loop {
-        match unsafe { MODE } {
-            Mode::PassiveJackUsb => {
+        let button_state = button.is_high().unwrap_or(true);
+
+        if last_button_state && !button_state {
+            mode = match mode {
+                DeviceMode::PassiveJackUsb => DeviceMode::BtSingle,
+                DeviceMode::BtSingle => DeviceMode::BtMulti,
+                DeviceMode::BtMulti => DeviceMode::PassiveJackUsb,
+            };
+        }
+        last_button_state = button_state;
+
+        match mode {
+            DeviceMode::PassiveJackUsb => {
+                led_r.set_high();
+                led_g.set_low();
+                led_b.set_low();
                 audio::route_jack_to_usb();
                 audio::route_usb_to_jack();
-                led.set_low();
             }
-            Mode::BtSingle => {
-                bt.enable_single();
+            DeviceMode::BtSingle => {
+                led_r.set_low();
+                led_g.set_high();
+                led_b.set_low();
+                bluetooth::enable_single(&spim);
                 audio::route_usb_or_jack_to_bt();
-                led.set_high();
             }
-            Mode::BtMulti => {
-                bt.enable_multi();
+            DeviceMode::BtMulti => {
+                led_r.set_low();
+                led_g.set_low();
+                led_b.set_high();
+                bluetooth::enable_multi(&spim);
                 audio::route_usb_or_jack_to_bt_multi();
-                led.toggle();
-                Timer::after(Duration::from_millis(500)).await;
             }
         }
 
-        if btn.is_low() {
-            unsafe {
-                MODE = match MODE {
-                    Mode::PassiveJackUsb => Mode::BtSingle,
-                    Mode::BtSingle => Mode::BtMulti,
-                    Mode::BtMulti => Mode::PassiveJackUsb,
-                };
-            }
-            Timer::after(Duration::from_millis(300)).await;
-        }
-
-        Timer::after(Duration::from_millis(10)).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn usb_task(mut driver: UsbDriver<'static, USBD>) {
-    loop {
-        driver.run().await;
+        Timer::after(hal::time::Hertz(100)).unwrap(); // simple delay
     }
 }
 
 mod bluetooth {
-    pub struct BtController;
+    use embedded_hal::blocking::spi::Write;
 
-    impl BtController {
-        pub fn new() -> Self {
-            Self
-        }
-        pub fn enable_single(&mut self) {}
-        pub fn enable_multi(&mut self) {}
-    }
+    pub fn enable_single<SPI: Write<u8>>(_spi: &SPI) {}
+    pub fn enable_multi<SPI: Write<u8>>(_spi: &SPI) {}
 }
 
 mod audio {
